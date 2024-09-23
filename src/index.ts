@@ -3,9 +3,36 @@ import ora from 'ora';
 import chalk from 'chalk';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
-import { Pipe } from 'langbase';
+import { Readable } from 'stream';
 
 dotenv.config();
+
+type ChunkType = 'content' | 'tool_call' | 'done';
+
+interface ParsedChunk {
+	type: ChunkType;
+	content?: string;
+	toolCall?: {
+		index: number;
+		id: string;
+		name: string;
+		arguments: any;
+	};
+}
+
+interface Env {
+	LANGBASE_ONLINE_STORE_CUSTOMER_SERVICE_API_KEY: string;
+	LANGBASE_SPORTS_PIPE_API_KEY: string;
+	LANGBASE_ELECTRONICS_PIPE_API_KEY: string;
+	LANGBASE_TRAVEL_PIPE_API_KEY: string;
+}
+
+const env: Env = {
+	LANGBASE_ONLINE_STORE_CUSTOMER_SERVICE_API_KEY: process.env.LANGBASE_ONLINE_STORE_CUSTOMER_SERVICE_API_KEY!,
+	LANGBASE_SPORTS_PIPE_API_KEY: process.env.LANGBASE_SPORTS_PIPE_API_KEY!,
+	LANGBASE_ELECTRONICS_PIPE_API_KEY: process.env.LANGBASE_ELECTRONICS_PIPE_API_KEY!,
+	LANGBASE_TRAVEL_PIPE_API_KEY: process.env.LANGBASE_TRAVEL_PIPE_API_KEY!,
+};
 
 function printEnvironmentVariables() {
 	console.log('Environment Variables:');
@@ -20,34 +47,6 @@ function printEnvironmentVariables() {
 		console.log(`${key}: ${process.env[key] || 'Not set'}`);
 	});
 }
-
-const csAgent = new Pipe({
-	apiKey: process.env.LANGBASE_ONLINE_STORE_CUSTOMER_SERVICE_API_KEY!,
-});
-
-interface Env {
-	LANGBASE_ONLINE_STORE_CUSTOMER_SERVICE_API_KEY: string;
-	LANGBASE_SPORTS_PIPE_API_KEY: string;
-	LANGBASE_ELECTRONICS_PIPE_API_KEY: string;
-	LANGBASE_TRAVEL_PIPE_API_KEY: string;
-}
-
-interface InternalMessage {
-	entity: 'main' | 'internal';
-	responseStream: ReadableStream;
-	toolCallDetected: boolean;
-	customerQuery?: string;
-	threadId: string;
-}
-
-const env: Env = {
-	LANGBASE_ONLINE_STORE_CUSTOMER_SERVICE_API_KEY: process.env.LANGBASE_ONLINE_STORE_CUSTOMER_SERVICE_API_KEY!,
-	LANGBASE_SPORTS_PIPE_API_KEY: process.env.LANGBASE_SPORTS_PIPE_API_KEY!,
-	LANGBASE_ELECTRONICS_PIPE_API_KEY: process.env.LANGBASE_ELECTRONICS_PIPE_API_KEY!,
-	LANGBASE_TRAVEL_PIPE_API_KEY: process.env.LANGBASE_TRAVEL_PIPE_API_KEY!,
-};
-
-const encoder = new TextEncoder();
 
 function getDepartmentKey(
 	functionName: string
@@ -95,140 +94,94 @@ async function callDepartment(
 	}
 }
 
-async function processMainChatbotResponse(
-	response: any,
-	env: Env,
-	threadId: string,
-	initialState: { entity: 'main' | 'internal'; toolCallDetected: boolean }
-): Promise<InternalMessage> {
-	let reader;
-	if (response.body && typeof response.body.getReader === 'function') {
-		reader = response.body.getReader();
-	} else {
-		const text = await response.text();
-		const lines = text.split('\n');
-		let lineIndex = 0;
-		reader = {
-			read: async () => {
-				if (lineIndex < lines.length) {
-					return {
-						done: false,
-						value: new TextEncoder().encode(lines[lineIndex++] + '\n'),
-					};
-				} else {
-					return { done: true, value: undefined };
-				}
-			},
-		};
-	}
-
+async function* streamChunks(response: any): AsyncGenerator<ParsedChunk, void, unknown> {
+	const stream = Readable.from(response.body);
 	const decoder = new TextDecoder();
+	let buffer = '';
+	let currentToolCall: ParsedChunk['toolCall'] | null = null;
 
-	let accumulatedToolCall: any = null;
-	let accumulatedArguments = '';
-	const sharedState = {
-		toolCallDetected: initialState.toolCallDetected,
-		entity: initialState.entity,
-	};
+	for await (const chunk of stream) {
+		buffer += decoder.decode(chunk, { stream: true });
+		const lines = buffer.split('\n');
+		buffer = lines.pop() || '';
 
-	const [processStream, responseStream] = new ReadableStream({
-		async start(controller: ReadableStreamDefaultController) {
-			try {
-				let buffer = '';
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
+		for (const line of lines) {
+			if (line.trim() === 'data: [DONE]') {
+				if (currentToolCall) {
+					yield { type: 'tool_call', toolCall: currentToolCall };
+					currentToolCall = null;
+				}
+				yield { type: 'done' };
+			} else if (line.startsWith('data: ')) {
+				try {
+					const data = JSON.parse(line.slice(6));
+					const delta = data.choices?.[0]?.delta;
 
-					buffer += decoder.decode(value, { stream: true });
-					const lines = buffer.split('\n');
-					buffer = lines.pop() || '';
+					if (delta?.content) {
+						yield { type: 'content', content: delta.content };
+					} else if (delta?.tool_calls?.[0]) {
+						const toolCall = delta.tool_calls[0];
+						if (!currentToolCall) {
+							currentToolCall = {
+								index: toolCall.index,
+								id: toolCall.id,
+								name: toolCall.function?.name,
+								arguments: toolCall.function?.arguments || '',
+							};
+						} else {
+							currentToolCall.arguments += toolCall.function?.arguments || '';
+						}
 
-					for (const line of lines) {
-						const result = await processLine(line, controller, env, threadId, accumulatedToolCall, accumulatedArguments, sharedState);
-						accumulatedToolCall = result[0];
-						accumulatedArguments = result[1];
+						if (currentToolCall.arguments.endsWith('}')) {
+							try {
+								currentToolCall.arguments = JSON.parse(currentToolCall.arguments);
+								yield { type: 'tool_call', toolCall: currentToolCall };
+								currentToolCall = null;
+							} catch (parseError) {
+								console.warn('Error parsing tool call arguments:', parseError);
+							}
+						}
 					}
+				} catch (error) {
+					console.warn('Error parsing chunk:', error);
 				}
-			} catch (error) {
-				console.error('Error in stream processing:', error);
-			} finally {
-				controller.close();
-			}
-		},
-	}).tee();
-
-	await processStream.pipeTo(new WritableStream());
-
-	return {
-		entity: sharedState.toolCallDetected ? 'internal' : 'main',
-		responseStream: responseStream,
-		toolCallDetected: sharedState.toolCallDetected,
-		customerQuery: '',
-		threadId: threadId,
-	};
-}
-
-async function processLine(
-	line: string,
-	controller: ReadableStreamDefaultController,
-	env: Env,
-	threadId: string,
-	accumulatedToolCall: any,
-	accumulatedArguments: string,
-	sharedState: { toolCallDetected: boolean }
-): Promise<[any, string]> {
-	if (line.trim() === 'data: [DONE]') {
-		controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-		return [accumulatedToolCall, accumulatedArguments];
-	}
-	if (!line.startsWith('data: ')) return [accumulatedToolCall, accumulatedArguments];
-
-	try {
-		const data = JSON.parse(line.slice(6));
-		if (!data.choices || !data.choices[0].delta) return [accumulatedToolCall, accumulatedArguments];
-
-		const delta = data.choices[0].delta;
-		if (delta.content) {
-			enqueueContentChunk(controller, data, delta.content);
-		} else if (delta.tool_calls) {
-			sharedState.toolCallDetected = true;
-			if (!accumulatedToolCall) {
-				accumulatedToolCall = delta.tool_calls[0];
-				accumulatedArguments = delta.tool_calls[0].function.arguments || '';
-			} else {
-				accumulatedArguments += delta.tool_calls[0].function.arguments || '';
-			}
-
-			if (accumulatedToolCall.function.name && accumulatedArguments.endsWith('}')) {
-				const departmentKey = getDepartmentKey(accumulatedToolCall.function.name);
-				if (departmentKey) {
-					const args = JSON.parse(accumulatedArguments);
-					const departmentResponse = await callDepartment(departmentKey, args.customerQuery, env, threadId);
-					let responseContent = formatDepartmentResponse(departmentResponse.completion);
-					console.log(`Dept response: ${responseContent}`);
-					enqueueContentChunk(controller, data, responseContent);
-				}
-				accumulatedToolCall = null;
-				accumulatedArguments = '';
 			}
 		}
-	} catch (error) {
-		console.warn('Error processing chunk:', error, 'Line:', line);
 	}
-
-	return [accumulatedToolCall, accumulatedArguments];
 }
 
-function enqueueContentChunk(controller: ReadableStreamDefaultController, data: any, content: string) {
-	// process.stdout.write(content);
-	const chunk = {
-		id: data.id,
-		object: data.object,
-		created: data.created,
-		model: data.model,
-		choices: [{ index: 0, delta: { content }, finish_reason: null }],
-	};
-	controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
+
+async function processMainChatbotResponse(
+	response: Response,
+	env: Env,
+	threadId: string
+): Promise<{ toolCallDetected: boolean; threadId: string }> {
+	let toolCallDetected = false;
+
+	for await (const chunk of streamChunks(response)) {
+		switch (chunk.type) {
+			case 'content':
+				if (chunk.content) {
+					process.stdout.write(chunk.content);
+				}
+				break;
+			case 'tool_call':
+				toolCallDetected = true;
+				const departmentKey = getDepartmentKey(chunk.toolCall!.name);
+				if (departmentKey) {
+					const departmentResponse = await callDepartment(departmentKey, chunk.toolCall!.arguments.customerQuery, env, threadId);
+					let responseContent = formatDepartmentResponse(departmentResponse.completion);
+					process.stdout.write(responseContent);
+				}
+				break;
+			case 'done':
+				process.stdout.write('\n');
+				break;
+		}
+	}
+
+	return { toolCallDetected, threadId };
 }
 
 function formatDepartmentResponse(response: string): string {
@@ -266,41 +219,6 @@ async function callMainChatbot(query: string, threadId: string | undefined, env:
 	}
 }
 
-async function streamResponse(responseStream: ReadableStream) {
-	const reader = responseStream.getReader();
-	const decoder = new TextDecoder();
-
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		const chunk = decoder.decode(value);
-		const lines = chunk.split('\n');
-		for (const line of lines) {
-			if (line.startsWith('data: ')) {
-				try {
-					const data = JSON.parse(line.slice(6));
-					if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
-						process.stdout.write(data.choices[0].delta.content);
-					}
-				} catch (error) {
-					// Ignore parsing errors
-				}
-			}
-		}
-	}
-	console.log(); // Add a new line after the response is complete
-}
-
-
-async function csAgentGreetings(): Promise<any[]> {
-  
-  const {stream, threadId} = await csAgent.streamText({
-    messages: [{role: 'user', content: 'Hello'}],
-    chat: true,
-  });
-  return [stream, threadId];
-}
-
 async function main() {
 	printEnvironmentVariables();
 
@@ -317,7 +235,7 @@ async function main() {
 
 		if (query.toLowerCase() === 'exit') break;
 
-		let internalMessage: InternalMessage;
+		let internalMessage: { toolCallDetected: boolean; threadId: string };
 
 		do {
 			const response = await callMainChatbot(query, threadId, env);
@@ -328,13 +246,9 @@ async function main() {
 				break;
 			}
 
-			internalMessage = await processMainChatbotResponse(response, env, threadId || '', {
-				entity: 'main',
-				toolCallDetected: false,
-			});
-			await streamResponse(internalMessage.responseStream);
+			internalMessage = await processMainChatbotResponse(response, env, threadId || '');
 
-			if (internalMessage.entity === 'internal') {
+			if (internalMessage.toolCallDetected) {
 				console.log(chalk.yellow('🔄 Calling department agents...'));
 				const response = await callMainChatbot('summarize the current status for the customer', threadId, env);
 				threadId = response.headers.get('lb-thread-id') || threadId;
@@ -344,13 +258,9 @@ async function main() {
 					break;
 				}
 
-				internalMessage = await processMainChatbotResponse(response, env, threadId || '', {
-					entity: 'main',
-					toolCallDetected: false,
-				});
-				await streamResponse(internalMessage.responseStream);
+				internalMessage = await processMainChatbotResponse(response, env, threadId || '');
 			}
-		} while (internalMessage.entity === 'internal');
+		} while (internalMessage.toolCallDetected);
 
 		console.log(chalk.green('✅ Final response ready'));
 	}
