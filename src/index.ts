@@ -6,8 +6,19 @@ async function main() {
 	printLangbaseAgentsVars();
 
 	let threadId: string | undefined;
+	
+	let internalMessage: { toolCallDetected: boolean; threadId: string };
+	let response: any;
+	response = await callMainCsAgent("Hello", threadId, env);
+	threadId = response.headers.get('lb-thread-id') || threadId;
 
+	if (!response.body) {
+		console.error('No readable stream found in response body');
+	}
+
+	await processMainCsAgentResponse(response, env, threadId || '');
 	while (true) {
+
 		const { query } = await inquirer.prompt([
 			{
 				type: 'input',
@@ -18,9 +29,7 @@ async function main() {
 
 		if (query.toLowerCase() === 'exit') break;
 
-		let internalMessage: { toolCallDetected: boolean; threadId: string };
-
-		const response = await callMainCsAgent(query, threadId, env);
+		response = await callMainCsAgent(query, threadId, env);
 		threadId = response.headers.get('lb-thread-id') || threadId;
 
 		if (!response.body) {
@@ -32,7 +41,7 @@ async function main() {
 
 		if (internalMessage.toolCallDetected) {
 			console.log(chalk.yellow('🔄 Calling department agents...'));
-			const response = await callMainCsAgent('summarize the current status for the customer', threadId, env);
+			const response = await callMainCsAgent('summarize the current ticket for the customer', threadId, env);
 			threadId = response.headers.get('lb-thread-id') || threadId;
 
 			if (!response.body) {
@@ -43,8 +52,7 @@ async function main() {
 			internalMessage = await processMainCsAgentResponse(response, env, threadId || '');
 		}
 
-
-		console.log(chalk.green('✅ Final response ready'));
+		console.log(chalk.green('✅ CS Agent response completed'));
 	}
 }
 
